@@ -49,9 +49,9 @@ def format_example(example, tokenizer):
 
 
 def get_dataloader(dataset, tokenizer, batch_size = 4):
-    formatted_dataset = dataset.map(partial(format_example, tokenizer=tokenizer))
+    formatted_dataset = dataset.map(partial(format_example, tokenizer=tokenizer), num_proc=4)
     formatted_dataset = formatted_dataset.remove_columns(
-        [col for col in dataset.column_names if col not in ["input_ids", "attention_mask", "labels"]]
+        [col for col in formatted_dataset.column_names if col not in ["input_ids", "attention_mask", "labels"]]
     )
     formatted_dataset.set_format("torch")
     collator = DataCollatorForSeq2Seq(tokenizer, padding=True)  

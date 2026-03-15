@@ -1,6 +1,7 @@
 from rewards import extract_answer, check_answer
 from data import get_dataset
 from model import load_model
+from peft import PeftModel
 
 def generate_and_eval(model, tokenizer, dataset, idx = 0):
     problem = dataset[idx]["problem"]
@@ -24,3 +25,14 @@ def generate_and_eval(model, tokenizer, dataset, idx = 0):
     print(dataset[idx]["answer"])
     print(extract_answer(response))
     print(check_answer(response, dataset[idx]["answer"]))
+
+def load_sft_model(base_model, checkpoint_path="checkpoints/sft"):
+    model = PeftModel.from_pretrained(base_model, checkpoint_path)
+    return model
+
+dataset = get_dataset()
+base_model, tokenizer = load_model()
+model = load_sft_model(base_model)
+model.eval()
+
+generate_and_eval(model, tokenizer, dataset, idx=0)
