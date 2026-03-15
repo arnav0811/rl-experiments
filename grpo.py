@@ -1,7 +1,7 @@
 from rewards import extract_answer, check_answer
 import torch
 
-def compute_rollouts(model, tokenizer, problems, ground_truth, num_samples = 8):
+def compute_rollouts(model, tokenizer, problems, ground_truth, num_samples = 8, length_penalty = 0.1):
     all_rollouts = []
     for problem, ground_truth in zip(problems, ground_truth):
         inputs = tokenizer.apply_chat_template(
@@ -28,13 +28,27 @@ def compute_rollouts(model, tokenizer, problems, ground_truth, num_samples = 8):
         responses = tokenizer.batch_decode(outputs.sequences[:, prompt_len:], skip_special_tokens=True)
         scores = [check_answer(response, ground_truth) for response in responses]
     
-        rewards = torch.tensor(scores, dtype = torch.float)
+        max_tokens = 512
+        correctness = torch.tensor(scores, dtype = torch.float)
+        response_sequences = outputs.sequences[:, prompt_len:]
+        eos_token_id = tokenizer.eos_token_id
+        lengths = torch.tensor([
+            (seq == eos_token_id).nonzero()[0].item() if (seq == eos_token_id).any() else seq.shape[0]
+            for seq in response_sequences
+        ], dtype=torch.float)
+        normalized_lengths = lengths / max_tokens
+        # reward = correctness - λ * (length / max_new_tokens)
+        # CoT compression
+        rewards = correctness - length_penalty * normalized_lengths
         advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
 
+        # we need to return the prompt IDs too such that train_grpo has context on what this rollout is conditioned on. 
         all_rollouts.append({
-            "sequences": outputs.sequences[: , prompt_len:],
+            "prompt_ids": inputs["input_ids"].squeeze(0),
+            "sequences": outputs.sequences[:, prompt_len:],
             "scores": scores,
             "advantages": advantages,
             "logits": outputs.scores,
+            "lengths": lengths,
         })
     return all_rollouts

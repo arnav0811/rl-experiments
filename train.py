@@ -32,10 +32,12 @@ def train_sft(model, tokenizer, dataset, num_epochs = 3, lr = 2e-4):
             # ignores positions where label = -100 (padding tokens)
             outputs = model(**batch)
             loss = outputs.loss
-            loss.backward()
-            optimizer.step()
             optimizer.zero_grad()
-        
+            loss.backward()
+            # gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
             if i % 10 == 0:
                 print(f"Epoch {epoch+1}, Step {i}, Loss: {loss.item():.4f}")
     
@@ -54,20 +56,33 @@ def train_grpo(model, tokenizer, dataset, num_epochs = 3, lr = 1e-4, batch_size 
             batch = dataset[i:i+batch_size]
             problems = batch["problem"]
             ground_truth = batch["answer"]
-            rollouts = compute_rollouts(model, tokenizer, problems, ground_truth)
+            with torch.no_grad():
+                rollouts = compute_rollouts(model, tokenizer, problems, ground_truth)
+            # whiel doing RL ask what is this forward pass conditioned on?
+            # we need to run teh forward pass on teh full sequence and slice logits only to the reponse positions. 
             for rollout in rollouts:    
+                prompt_ids = rollout["prompt_ids"].to(model.device)
                 sequences = rollout["sequences"].to(model.device)
-                attention_mask = torch.ones_like(sequences)
-                outputs = model(input_ids = sequences, attention_mask = attention_mask)
-                logits = outputs.logits # shape: [batch_size, seq_len, vocab_size]
-                log_probs = torch.log_softmax(logits, dim = -1)
+                lengths = rollout["lengths"] 
+                # prompt_ids is shape [promt_len] and sequences is shape [num_sampes, response_len]
+                prompt_expanded = prompt_ids.unsqueeze(0).expand(sequences.shape[0], -1)
+                full_sequences = torch.cat([prompt_expanded, sequences], dim = 1)
+                attention_mask = torch.ones_like(full_sequences)
+                outputs = model(input_ids = full_sequences, attention_mask = attention_mask)
+
+                
+                logits = outputs.logits 
+                # logits at index i predict tokens at index i + 1
+                prompt_len = prompt_ids.shape[0]
+                response_logits = logits[:, prompt_len - 1 : prompt_len + sequences.shape[1] - 1, :]
+                response_log_probs = torch.log_softmax(response_logits, dim = -1)
                 # gather the log prob of the token that was actually generated at each position
-                token_log_probs = log_probs[:, :-1].gather(2, sequences[:, 1:].unsqueeze(2)).squeeze(2)
+                token_log_probs = response_log_probs.gather(2, sequences.unsqueeze(2)).squeeze(2)
 
 
-                old_logits = torch.stack(rollout["logits"], dim=1)
-                old_log_probs_all = torch.log_softmax(old_logits, dim=-1)
-                old_token_log_probs = old_log_probs_all.gather(2, sequences[:, 1:].unsqueeze(2)).squeeze(2)
+                old_logits = torch.stack(rollout["logits"], dim=1)  
+                old_log_probs = torch.log_softmax(old_logits, dim=-1)
+                old_token_log_probs = old_log_probs.gather(2, sequences.unsqueeze(2)).squeeze(2)
 
                 ratio = torch.exp(token_log_probs - old_token_log_probs)
                 advantages = rollout["advantages"].to(model.device)
@@ -78,20 +93,31 @@ def train_grpo(model, tokenizer, dataset, num_epochs = 3, lr = 1e-4, batch_size 
                 clipped_ratio = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
                 policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
 
-                ref_outputs = reference_model(input_ids = sequences, attention_mask = attention_mask)
+                # we only need the log probs and not gradients
+                with torch.no_grad():
+                    ref_outputs = reference_model(input_ids = full_sequences, attention_mask = attention_mask)
                 ref_logits = ref_outputs.logits
-                ref_log_probs_all = torch.log_softmax(ref_logits, dim=-1)
-                ref_token_log_probs = ref_log_probs_all.gather(2, sequences[:, 1:].unsqueeze(2)).squeeze(2)
+                ref_response_logits = ref_logits[:, prompt_len - 1 : prompt_len + sequences.shape[1] - 1, :]
+                ref_response_log_probs = torch.log_softmax(ref_response_logits, dim=-1)
+                ref_token_log_probs = ref_response_log_probs.gather(2, sequences.unsqueeze(2)).squeeze(2)
 
                 # KL(P||Q) = sum(P * log(P/Q))
-                kl = (torch.exp(token_log_probs) * (token_log_probs - ref_token_log_probs)).mean()
+                # this is an approximation of the KL divergence using the log probabilities.
+                kl = (token_log_probs - ref_token_log_probs).mean()
                 # beta = 0.1
                 loss = policy_loss + 0.1 * kl
-                loss.backward()
-                optimizer.step()
                 optimizer.zero_grad()
+                loss.backward()
+                # gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
                 if i % 10 == 0:
-                    print(f"Epoch {epoch+1}, Step {i}, Loss: {loss.item():.4f}")
+                    mean_reward = rollout["advantages"].mean().item()  
+                    mean_correct = sum(rollout["scores"]) / len(rollout["scores"])
+                    mean_length = lengths.mean().item()
+                    print(f"Epoch {epoch+1}, Step {i}, Loss: {loss.item():.4f}, "
+                        f"PL: {policy_loss.item():.4f}, KL: {kl.item():.4f}, "
+                        f"Correct: {mean_correct:.2f}, AvgLen: {mean_length:.0f}")
         
     model.save_pretrained("checkpoints/grpo")
     tokenizer.save_pretrained("checkpoints/grpo")
